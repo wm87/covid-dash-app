@@ -21,8 +21,8 @@ Das Dashboard lädt Daten von der Johns Hopkins University und ermöglicht versc
 
 ### Repository klonen
 ```bash
-   git clone <REPO_URL>
-   cd <PROJEKTORDNER>
+   git clone https://github.com/wm87/covid_app.git
+   cd covid_app
 ```
 
 ### Python-Umgebung erstellen (optional, empfohlen)
@@ -57,7 +57,7 @@ NE_SHAPEFILE_PATH = "ne_10m_admin_0_countries.shp"
 ## ⚙️ Starten
 ```bash
 streamlit run covid_dashboard.py
-# Ersetze app.py durch den Dateinamen deines Scripts.
+# Ersetze covid_dashboard.py durch den Dateinamen deines Scripts.
 ```
 
 Streamlit öffnet automatisch den Browser.
