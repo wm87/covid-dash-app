@@ -74,8 +74,6 @@ NE_SHAPEFILE_PATH = "ne_10m_admin_0_countries.shp"  # Pfad anpassen
 # Lokale Shapefile laden
 world = gpd.read_file(NE_SHAPEFILE_PATH)
 
-print(world.columns)
-
 country_col = None
 for col in ["ADMIN"]:
     if col in world.columns:
@@ -344,7 +342,7 @@ with tab2:
 
 # Weltkarte
 with tab3:
-    st.subheader("Interaktive Weltkarte mit Plotly Express")
+    st.subheader("Heatmap-ähnliche Weltkarte mit metriksensitiver Punktgröße")
 
     selected_metric = st.selectbox(
         "Metrik auswählen:",
@@ -359,12 +357,10 @@ with tab3:
     anim_df = anim_df[
         (anim_df["Date"] >= pd.Timestamp(date_range[0])) &
         (anim_df["Date"] <= pd.Timestamp(date_range[1]))
-        ]
+    ]
 
     anim_df["YearMonth"] = anim_df["Date"].dt.to_period("M").dt.to_timestamp()
 
-    # Bereit mit NE-Koordinaten, also keine zusätzliche Koordinatenquelle nötig
-    # Aggregation je nach Metrik
     if selected_metric == "New Confirmed":
         aggregated_df = (
             anim_df
@@ -378,12 +374,16 @@ with tab3:
             .agg({selected_metric: "max"})
         )
 
+    aggregated_df = aggregated_df.dropna(subset=["Lat", "Long"])
+
+    # Farbpalette pro Kontinent
     unique_cats = aggregated_df["Continent"].unique()
     palette = px.colors.qualitative.Safe
     if len(unique_cats) > len(palette):
         palette = (palette * ((len(unique_cats) // len(palette)) + 1))[:len(unique_cats)]
     color_map = dict(zip(unique_cats, palette))
 
+    # Punktgröße skalieren
     min_radius = 3
     max_radius = 30
     max_val = aggregated_df[selected_metric].max()
@@ -402,46 +402,34 @@ with tab3:
         "size_scaled": False
     }
 
-    fig_anim = px.scatter_geo(
+    fig = px.scatter_map(
         aggregated_df,
         lat="Lat",
         lon="Long",
         size="size_scaled",
-        color="Continent",
+        color=selected_metric,  # Farbverlauf basierend auf der Metrik
         hover_name="Country",
         hover_data=hover_data,
         animation_frame=aggregated_df["YearMonth"].dt.strftime('%Y-%m'),
-        projection="natural earth",
-        title=f"Animierte COVID-19 {selected_metric} weltweit (aggregiert pro Monat und Land)",
+        zoom=1,
+        height=700,
+        title=f"COVID-19 {selected_metric} – skalierte Heatmap (monatlich, OpenStreetMap)",
         size_max=max_radius,
-        template="plotly_white",
-        color_discrete_map=color_map,
+        map_style="open-street-map",
+        color_continuous_scale="YlOrRd",  # Optional: Farbschema für metrische Intensität
     )
 
-    fig_anim.update_layout(
+    fig.update_layout(
         margin=dict(l=0, r=0, t=40, b=0),
-        legend_title_text="Kontinent",
-        geo=dict(
-            showland=True,
-            landcolor="rgb(240,240,240)",
-            oceancolor="rgb(230,230,255)",
-            showocean=True,
-            lakecolor="rgb(200,200,255)",
-            showcountries=True,
-            countrycolor="gray",
-            showframe=False,
-            projection_type="natural earth",
-            resolution=110
-        ),
-        dragmode="zoom"
+        coloraxis_colorbar=dict(title=selected_metric),
+        legend_title_text=None
     )
 
-    # Animation Geschwindigkeit erhöhen
-    if fig_anim.layout.updatemenus:
-        fig_anim.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 700
-        fig_anim.layout.updatemenus[0].buttons[1].args[1]['frame']['duration'] = 0
+    if fig.layout.updatemenus:
+        fig.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 700
+        fig.layout.updatemenus[0].buttons[1].args[1]['frame']['duration'] = 0
 
-    st.plotly_chart(fig_anim, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
 
 # CSV Download
 with tab4:
