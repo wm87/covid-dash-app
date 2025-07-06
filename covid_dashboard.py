@@ -1,15 +1,16 @@
+# 📦 Imports
+from concurrent.futures import ThreadPoolExecutor
+
+import folium
 import geopandas as gpd
 import numpy as np
-import pandas as pd
 import plotly.express as px
 import polars as pl
 import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+from folium.plugins import HeatMap
+from streamlit_folium import st_folium
 
-# Auto-Refresh alle 5 Minuten
-st_autorefresh(interval=5 * 60 * 1000, key="datarefresh")
-
-# CSV-URLs
+# 🌐 Datenquellen (CSSE GitHub)
 BASE_URL = (
     "https://raw.githubusercontent.com/CSSEGISandData/COVID-19/master/"
     "csse_covid_19_data/csse_covid_19_time_series/"
@@ -20,16 +21,12 @@ URLS = {
     "Recovered": BASE_URL + "time_series_covid19_recovered_global.csv",
 }
 
+# 🔧 Länder-Namen vereinheitlichen
 country_name_corrections = {
-    # USA Varianten
     "United States of America": "US",
-
-    # UK Varianten
     "UK": "United Kingdom",
     "Great Britain": "United Kingdom",
     "England": "United Kingdom",
-
-    # Andere häufige Abweichungen
     "Russian Federation": "Russia",
     "South Korea": "Republic of Korea",
     "North Korea": "Democratic People's Republic of Korea",
@@ -68,384 +65,298 @@ country_name_corrections = {
     "Kingdom of Saudi Arabia": "Saudi Arabia",
 }
 
-# --- Natural Earth Daten laden ---
-NE_SHAPEFILE_PATH = "ne_10m_admin_0_countries.shp"  # Pfad anpassen
+# 🌍 Shapefile für Ländergrenzen
+NE_SHAPEFILE_PATH = "ne_10m_admin_0_countries.shp"
+country_col = "ADMIN"
 
-# Lokale Shapefile laden
-world = gpd.read_file(NE_SHAPEFILE_PATH)
+# ---------------------------------------------------
+# 📥 Datenladen und Vorverarbeitung
+# ---------------------------------------------------
 
-country_col = None
-for col in ["ADMIN"]:
-    if col in world.columns:
-        country_col = col
-        break
-if country_col is None:
-    raise ValueError("Keine passende Spalte für Ländernamen gefunden")
+@st.cache_data
+def load_covid_csvs() -> dict[str, pl.DataFrame]:
+    return {k: pl.read_csv(url) for k, url in URLS.items()}
 
-# world ist dein GeoDataFrame mit Geometrien in EPSG:4326 (lat/lon)
-world_proj = world.to_crs(epsg=3857)  # projiziert auf Web Mercator (Meter)
-world_proj['centroid'] = world_proj.geometry.centroid  # jetzt genaue Centroid-Berechnung
+@st.cache_data
+def load_shapefile(path: str) -> gpd.GeoDataFrame:
+    world = gpd.read_file(path)
+    world_proj = world.to_crs(epsg=3857)
+    world_proj['centroid'] = world_proj.geometry.centroid
+    world['centroid'] = world_proj['centroid'].to_crs(epsg=4326)
+    world['Longitude'] = world['centroid'].x
+    world['Latitude'] = world['centroid'].y
+    return world
 
-# zurück projizieren auf lat/lon
-world['centroid'] = world_proj['centroid'].to_crs(epsg=4326)
+def standardize_country_names(raw_list: list[str], shapefile_names: set[str]) -> list[str]:
+    name_map = {v: k for k, v in country_name_corrections.items()}
+    result = []
+    for name in raw_list:
+        if name in shapefile_names:
+            result.append(name)
+        elif name in country_name_corrections:
+            result.append(country_name_corrections[name])
+        elif name in name_map:
+            result.append(name_map[name])
+        else:
+            result.append(name)
+    return sorted(set(result))
 
-# Lat/Lon extrahieren
-world['Longitude'] = world['centroid'].x
-world['Latitude'] = world['centroid'].y
+@st.cache_data
+def build_country_coords(_world_df: gpd.GeoDataFrame, countries: list[str]) -> dict[str, tuple[float, float]]:
+    coords_df = _world_df[[country_col, "Longitude", "Latitude"]].copy()
+    coords_df.rename(columns={country_col: "Country"}, inplace=True)
 
-coords_df = world[[country_col, "Longitude", "Latitude"]].copy()
-coords_df.rename(columns={country_col: "Country"}, inplace=True)
+    def get_coords(name: str):
+        corrected = country_name_corrections.get(name, name)
+        row = coords_df[coords_df["Country"] == corrected]
+        if not row.empty:
+            return name, (row.iloc[0]["Latitude"], row.iloc[0]["Longitude"])
+        return name, (np.nan, np.nan)
 
+    with ThreadPoolExecutor() as executor:
+        return dict(executor.map(get_coords, countries))
 
-# Beispiel: CSVs laden und alle Länder
-dfs = {k: pl.read_csv(url) for k, url in URLS.items()}
-all_countries = dfs["Confirmed"]["Country/Region"].unique().to_list()
-all_countries.sort()
+@st.cache_data(ttl=300)
+def prepare_data(countries: list[str], metric: str, avg: str, per_100k: bool,
+                 dfs: dict, coords: dict, population: dict, continent_map: dict) -> pl.DataFrame:
+    dfs_list = []
+    for country in countries:
+        df_c = dfs["Confirmed"].filter(pl.col("Country/Region") == country)
+        df_d = dfs["Deaths"].filter(pl.col("Country/Region") == country)
+        df_r = dfs["Recovered"].filter(pl.col("Country/Region") == country)
 
-#print(sorted(all_countries))
+        sum_c = df_c.drop(["Province/State", "Lat", "Long", "Country/Region"]).sum()
+        sum_d = df_d.drop(["Province/State", "Lat", "Long", "Country/Region"]).sum()
+        sum_r = df_r.drop(["Province/State", "Lat", "Long", "Country/Region"]).sum()
 
+        dates = sum_c.columns
+        df = pl.DataFrame({
+            "Date": dates,
+            "Confirmed": sum_c.row(0),
+            "Deaths": sum_d.row(0),
+            "Recovered": sum_r.row(0),
+        }).with_columns(pl.col("Date").str.to_date("%m/%d/%y")).sort("Date")
 
-def get_coords(country_name):
-    # Korrigierten Ländernamen suchen
-    corrected_name = country_name_corrections.get(country_name, country_name)
-    row = coords_df[coords_df['Country'] == corrected_name]
-    if not row.empty:
-        return row.iloc[0]['Latitude'], row.iloc[0]['Longitude']
-    return np.nan, np.nan
+        df = df.with_columns([
+            pl.col("Confirmed").diff().fill_null(0).alias("New Confirmed"),
+            (pl.col("Confirmed") - pl.col("Deaths") - pl.col("Recovered")).alias("Active")
+        ])
 
+        if avg != "None":
+            df = df.with_columns(
+                pl.col(metric if metric != "New Confirmed" else "New Confirmed")
+                .rolling_mean(window_size=int(avg), min_samples=1)
+                .alias(metric)
+            )
 
-country_coords = {c: get_coords(c) for c in all_countries}
+        if per_100k:
+            pop = population.get(country, 1_000_000)
+            for col in ["Confirmed", "Deaths", "Recovered", "Active", "New Confirmed"]:
+                df = df.with_columns((pl.col(col) / pop * 100_000).alias(col))
 
-# Dummy-Populationen
+        lat, lon = coords.get(country, (np.nan, np.nan))
+        df = df.with_columns([
+            pl.lit(country).alias("Country"),
+            pl.lit(continent_map.get(country, "Other")).alias("Continent"),
+            pl.lit(lat).alias("Lat"),
+            pl.lit(lon).alias("Long"),
+        ])
+
+        dfs_list.append(df)
+
+    return pl.concat(dfs_list).sort(["Country", "Date"])
+
+# ✂️ Ab hier: Alles gleich wie in deinem bisherigen Code...
+
+# ---------------------------------------------------
+# 🌐 Initialisierung & UI
+# ---------------------------------------------------
+
+dfs = load_covid_csvs()
+world = load_shapefile(NE_SHAPEFILE_PATH)
+
+shapefile_countries = set(world[country_col].unique())
+raw_countries = dfs["Confirmed"]["Country/Region"].unique().to_list()
+all_countries = standardize_country_names(raw_countries, shapefile_countries)
+country_coords = build_country_coords(world, all_countries)
+
+# Bevölkerungen (vereinfachend: gleichmäßig)
 country_population = {c: 1_000_000 for c in all_countries}
 
-# Set Streamlit Page Config
+# Kontinente zuordnen
+country_to_continent = {}
+for _, row in world.iterrows():
+    name = row[country_col]
+    country_to_continent[name] = row["CONTINENT"]
+    for k, v in country_name_corrections.items():
+        if v == name:
+            country_to_continent[k] = row["CONTINENT"]
+
+# 🎛️ Streamlit Konfiguration
 st.set_page_config(layout="wide")
 st.title("🦠 COVID-19 Ultimate Dashboard")
 
-date_columns = [col for col in dfs["Confirmed"].columns if col not in (
-    "Province/State", "Country/Region", "Lat", "Long")]
-date_columns.sort()
-
+# Sidebar – Erst Auswahl (ohne Metrik)
 with st.sidebar:
-    st.header("⚙️ Einstellungen")
-
-    view = st.radio(
-        "Anzeige nach:",
-        ["Countries", "Continents"],
-        index=0
-    )
-
-    # Automatisch Kontinente aus Natural Earth (über Länder extrahieren)
+    view = st.radio("Anzeige nach:", ["Countries", "Continents"], index=0)
     continents = sorted(set(world['CONTINENT'].dropna().unique()))
 
-    # Für Länder-Continent Mapping (Natural Earth 'CONTINENT' Spalte nutzen)
-    # Mapping dict
-    country_to_continent = {}
-    for idx, row in world.iterrows():
-        admin_name = row['ADMIN']
-        cont_name = row['CONTINENT']
-        # Korrekturen übernehmen (nur wenn admin_name in deinem Landelist auftaucht)
-        if admin_name in all_countries:
-            country_to_continent[admin_name] = cont_name
-
     if view == "Countries":
-        desired_defaults = [
-            "USA", "India", "Brazil", "Russia", "China", "Poland",
-            "Ireland", "Turkey", "Japan", "Chile", "Canada", "Australia",
-            "Saudi Arabia", "Namibia", "Mexico", "Sweden", "Greenland",
-            "Germany", "United Kingdom", "France", "Italy", "Spain"
-        ]
-        available_defaults = [c for c in desired_defaults if c in all_countries]
-
-        countries = st.multiselect(
-            "Länder auswählen",
-            sorted(all_countries),
-            default=available_defaults
-        )
+        # Standardmäßig ausgewählte Länder, nur wenn sie existieren
+        default_countries = [c for c in ["US", "India", "Brazil", "Germany", "Turkey", "UK", "France", "China"] if c in all_countries]
+        countries = st.multiselect("Länder auswählen", sorted(all_countries), default=default_countries)
     else:
-        selected_continents = st.multiselect(
-            "Kontinente auswählen",
-            continents,
-            default=["Europe", "Asia"]
-        )
-        countries = [
-            c for c in all_countries if country_to_continent.get(c) in selected_continents
-        ]
+        # Standardmäßig Europa und Asien
+        sel_cont = st.multiselect("Kontinente auswählen", continents, default=["Europe", "Asia"])
+        countries = [c for c in all_countries if country_to_continent.get(c) in sel_cont]
 
-    metric = st.selectbox(
-        "Metrik",
-        ["Confirmed", "Deaths", "Recovered", "New Confirmed"]
-    )
+# 📊 Tabs
+tab_names = ["📈 Verlauf", "🌡️ Heatmap", "🌍 Karte", "🔥 Folium", "📥 CSV", "📸 Export"]
 
-    per_100k = st.checkbox("pro 100.000 Einwohner")
-    avg_choice = st.selectbox(
-        "Moving Average",
-        ["None", "7", "14", "30"],
-        index=1
-    )
+if "active_tab" not in st.session_state:
+    st.session_state.active_tab = tab_names[0]
 
+def update_tab():
+    st.session_state.active_tab = st.session_state.selected_tab
+
+selected_tab = st.selectbox("Ansicht auswählen:", tab_names,
+                            index=tab_names.index(st.session_state.active_tab),
+                            key="selected_tab", on_change=update_tab)
+
+# ⛔ Kein Land gewählt?
 if not countries:
-    st.warning("Bitte mindestens ein Land oder Kontinent auswählen.")
+    st.warning("Bitte mindestens ein Land auswählen.")
     st.stop()
 
-# --- Datenvorbereitung ---
-long_dfs = []
-for country in countries:
-    df_confirmed = dfs["Confirmed"].filter(pl.col("Country/Region") == country)
-    df_deaths = dfs["Deaths"].filter(pl.col("Country/Region") == country)
-    df_recovered = dfs["Recovered"].filter(pl.col("Country/Region") == country)
+# Metrik-Steuerung NUR für visuelle Tabs
+show_metric_controls = selected_tab not in ["📥 CSV", "📸 Export"]
 
-    sum_confirmed = df_confirmed.drop(
-        ["Province/State", "Lat", "Long", "Country/Region"]
-    ).sum()
-    dates = sum_confirmed.columns
-    confirmed_cases = sum_confirmed.row(0)
+if show_metric_controls:
+    with st.sidebar:
+        metric = st.selectbox("Metrik", ["Confirmed", "Deaths", "Recovered", "New Confirmed"])
+        per_100k = st.checkbox("pro 100.000 Einwohner")
+        avg_choice = st.selectbox("Gleitender Durchschnitt", ["None", "7", "14", "30"], index=1)
+else:
+    # Platzhalter
+    metric = "Confirmed"
+    per_100k = False
+    avg_choice = "None"
 
-    sum_deaths = df_deaths.drop(
-        ["Province/State", "Lat", "Long", "Country/Region"]
-    ).sum()
-    deaths_cases = sum_deaths.row(0)
+# 📊 Daten vorbereiten
+combined_df = prepare_data(countries, metric, avg_choice, per_100k, dfs,
+                           country_coords, country_population, country_to_continent)
 
-    sum_recovered = df_recovered.drop(
-        ["Province/State", "Lat", "Long", "Country/Region"]
-    ).sum()
-    recovered_cases = sum_recovered.row(0)
-
-    pl_df = pl.DataFrame({
-        "Date": dates,
-        "Confirmed": confirmed_cases,
-        "Deaths": deaths_cases,
-        "Recovered": recovered_cases,
-    }).with_columns(
-        pl.col("Date").str.to_date("%m/%d/%y")
-    ).sort("Date")
-
-    pl_df = pl_df.with_columns(
-        pl.col("Confirmed").diff().fill_null(0).alias("New Confirmed")
-    )
-
-    display_metric = "New Confirmed" if metric == "New Confirmed" else metric
-
-    if avg_choice != "None":
-        pl_df = pl_df.with_columns(
-            pl.col(display_metric).rolling_mean(window_size=int(avg_choice), min_samples=1)
-            .alias(display_metric)
-        )
-
-    pl_df = pl_df.with_columns(
-        (pl.col("Confirmed") - pl.col("Deaths") - pl.col("Recovered")).alias("Active")
-    )
-
-    if per_100k:
-        pop = country_population.get(country)
-        if pop:
-            for colname in ["Confirmed", "Deaths", "Recovered", "Active", "New Confirmed"]:
-                pl_df = pl_df.with_columns(
-                    (pl.col(colname) / pop * 100000).alias(colname)
-                )
-        else:
-            st.warning(f"⚠️ Keine Bevölkerungszahl für {country}")
-
-    lat, lon = country_coords.get(country, (np.nan, np.nan))
-    pl_df = pl_df.with_columns(
-        pl.lit(country).alias("Country"),
-        pl.lit(country_to_continent.get(country, "Other")).alias("Continent"),
-        pl.lit(lat).alias("Lat"),
-        pl.lit(lon).alias("Long"),
-    )
-
-    long_dfs.append(pl_df)
-
-combined_df = pl.concat(long_dfs).sort(["Country", "Date"])
+# 📆 Zeitraumfilter
 min_date = combined_df["Date"].min()
 max_date = combined_df["Date"].max()
+date_range = st.slider("Zeitraum wählen:", min_value=min_date, max_value=max_date,
+                       value=(min_date, max_date), format="DD.MM.YYYY")
 
-date_range = st.slider(
-    "Zeitraum:",
-    min_value=min_date,
-    max_value=max_date,
-    value=(min_date, max_date),
-    format="DD.MM.YYYY"
-)
-
-filtered_df = combined_df.filter(
-    (pl.col("Date") >= date_range[0]) & (pl.col("Date") <= date_range[1])
-)
-
+filtered_df = combined_df.filter((pl.col("Date") >= date_range[0]) & (pl.col("Date") <= date_range[1]))
 plot_df = filtered_df.to_pandas()
 
-# --- Tabs ---
-
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
-    "📈 Verlauf", "🌡️ Heatmap", "🌍 Weltkarte", "📥 CSV", "📸 Export Hinweis"
-])
-
-# Verlauf
-with tab1:
-    st.subheader("Zeitverlauf")
+# 📈 Verlauf
+if selected_tab == "📈 Verlauf":
+    st.subheader("Verlauf der Fälle")
     if view == "Countries":
-        fig_line = px.line(
-            plot_df,
-            x="Date",
-            y=metric if metric != "New Confirmed" else "New Confirmed",
-            color="Country",
-            title="Verlauf nach Land"
-        )
+        fig = px.line(plot_df, x="Date", y=metric, color="Country", title="Zeitverlauf")
     else:
-        df_group = plot_df.groupby(["Date", "Continent"]).sum(numeric_only=True).reset_index()
-        fig_line = px.line(
-            df_group,
-            x="Date",
-            y=metric if metric != "New Confirmed" else "New Confirmed",
-            color="Continent",
-            title="Verlauf nach Kontinent"
-        )
-    st.plotly_chart(fig_line, use_container_width=True)
+        grp = plot_df.groupby(["Date", "Continent"]).sum(numeric_only=True).reset_index()
+        fig = px.line(grp, x="Date", y=metric, color="Continent", title="Zeitverlauf")
+    st.plotly_chart(fig, use_container_width=True)
 
-# Heatmap
-with tab2:
-    st.subheader("Heatmap der Fälle")
+# 🌡️ Heatmap
+elif selected_tab == "🌡️ Heatmap":
+    st.subheader("Heatmap der Fälle nach Datum/Land")
+    cmap = st.selectbox("Farbschema", ["Viridis", "Plasma", "Cividis", "Inferno"])
+    dfgrp = plot_df.groupby(["Date", "Country"])[metric].sum().reset_index()
+    hm = dfgrp.pivot(index="Country", columns="Date", values=metric).fillna(0)
+    logscale = st.checkbox("Logarithmische Skala", True)
+    vals = np.where(hm.values < 0, 0, hm.values)
+    vals = np.log1p(vals) if logscale else vals
+    fig2 = px.imshow(vals, x=hm.columns.strftime("%Y-%m-%d"), y=hm.index,
+                     labels=dict(color="log(1 + Fälle)" if logscale else "Fälle"),
+                     color_continuous_scale=cmap, aspect="auto")
+    fig2.update_layout(xaxis_nticks=20, yaxis={'autorange': 'reversed'})
+    st.plotly_chart(fig2, use_container_width=True)
 
-    color_scale = st.selectbox(
-        "Farbschema für die Heatmap",
-        ["Viridis", "Plasma", "Cividis", "Inferno"],
-        index=0
-    )
+# 🌍 Karte
+elif selected_tab == "🌍 Karte":
+    st.subheader("Weltkarte mit Animation")
 
-    df_group = plot_df.groupby(["Date", "Country"])[
-        metric if metric != "New Confirmed" else "New Confirmed"].sum().reset_index()
-    heatmap_df = df_group.pivot(index="Country", columns="Date",
-                                values=metric if metric != "New Confirmed" else "New Confirmed").fillna(0)
-    apply_log = st.checkbox("Logarithmische Farbskala", value=True, key="heatmap_log")
-    if apply_log:
-        heatmap_vals = np.log1p(heatmap_df.values)
-        colorbar_title = "log(1 + Fälle)"
-    else:
-        heatmap_vals = heatmap_df.values
-        colorbar_title = "Fälle"
-    fig_heat = px.imshow(
-        heatmap_vals,
-        labels=dict(x="Datum", y="Land", color=colorbar_title),
-        x=[d.strftime("%Y-%m-%d") if hasattr(d, "strftime") else str(d) for d in heatmap_df.columns],
-        y=heatmap_df.index,
-        color_continuous_scale=color_scale,
-        aspect="auto",
-        title="Heatmap der COVID-19 Fälle"
-    )
-    fig_heat.update_layout(
-        xaxis_nticks=20,
-        yaxis={'autorange': 'reversed'},
-        margin=dict(l=100, r=20, t=50, b=100)
-    )
-    st.plotly_chart(fig_heat, use_container_width=True)
+    sel = metric  # für Karte wird dieselbe Metrik genutzt
 
-# Weltkarte
-with tab3:
-    st.subheader("Heatmap-ähnliche Weltkarte mit metriksensitiver Punktgröße")
+    # Daten vorbereiten
+    anim = plot_df.copy()
+    anim["YearMonth"] = anim["Date"].dt.to_period("M").dt.to_timestamp()
 
-    selected_metric = st.selectbox(
-        "Metrik auswählen:",
-        ["Confirmed", "Deaths", "Recovered", "New Confirmed"],
-        index=0,
-        key="metric_map"
-    )
+    # Aggregation
+    agg = anim.groupby(["Country", "YearMonth", "Continent", "Lat", "Long"], as_index=False)[sel]
+    agg = agg.sum() if sel == "New Confirmed" else agg.max()
+    agg = agg.dropna(subset=["Lat", "Long"])
 
-    anim_df = combined_df.to_pandas()
-    anim_df["Date"] = pd.to_datetime(anim_df["Date"])
+    # Größe für Punktgröße auf Karte berechnen
+    maxv = agg[sel].max() or 1
+    agg["size_scaled"] = agg[sel].apply(lambda x: max(3, np.sqrt(max(0, x / maxv)) * 30))
 
-    anim_df = anim_df[
-        (anim_df["Date"] >= pd.Timestamp(date_range[0])) &
-        (anim_df["Date"] <= pd.Timestamp(date_range[1]))
-    ]
+    # Spalten für Tooltip explizit festlegen (keine Lat, Long, size_scaled)
+    hover_data = {sel: True, "Country": True, "Continent": (view == "Continents")}
 
-    anim_df["YearMonth"] = anim_df["Date"].dt.to_period("M").dt.to_timestamp()
-
-    if selected_metric == "New Confirmed":
-        aggregated_df = (
-            anim_df
-            .groupby(["Country", "YearMonth", "Continent", "Lat", "Long"], as_index=False)
-            .agg({selected_metric: "sum"})
-        )
-    else:
-        aggregated_df = (
-            anim_df
-            .groupby(["Country", "YearMonth", "Continent", "Lat", "Long"], as_index=False)
-            .agg({selected_metric: "max"})
-        )
-
-    aggregated_df = aggregated_df.dropna(subset=["Lat", "Long"])
-
-    # Farbpalette pro Kontinent
-    unique_cats = aggregated_df["Continent"].unique()
-    palette = px.colors.qualitative.Safe
-    if len(unique_cats) > len(palette):
-        palette = (palette * ((len(unique_cats) // len(palette)) + 1))[:len(unique_cats)]
-    color_map = dict(zip(unique_cats, palette))
-
-    # Punktgröße skalieren
-    min_radius = 3
-    max_radius = 30
-    max_val = aggregated_df[selected_metric].max()
-    if max_val == 0 or pd.isna(max_val):
-        max_val = 1
-
-    aggregated_df["size_scaled"] = aggregated_df[selected_metric].apply(
-        lambda x: max(min_radius, np.sqrt(x / max_val) * max_radius)
-    )
-
-    hover_data = {
-        selected_metric: ":,.0f",
-        "YearMonth": True,
-        "Lat": False,
-        "Long": False,
-        "size_scaled": False
-    }
-
-    fig = px.scatter_map(
-        aggregated_df,
-        lat="Lat",
-        lon="Long",
-        size="size_scaled",
-        color=selected_metric,  # Farbverlauf basierend auf der Metrik
+    # Weltkarte mit Animation erzeugen
+    fig3 = px.scatter_map(
+        agg, lat="Lat", lon="Long", size="size_scaled",
+        color="Continent" if view == "Continents" else sel,
         hover_name="Country",
-        hover_data=hover_data,
-        animation_frame=aggregated_df["YearMonth"].dt.strftime('%Y-%m'),
-        zoom=1,
-        height=700,
-        title=f"COVID-19 {selected_metric} – skalierte Heatmap (monatlich, OpenStreetMap)",
-        size_max=max_radius,
-        map_style="open-street-map",
-        color_continuous_scale="YlOrRd",  # Optional: Farbschema für metrische Intensität
+        hover_data={
+            sel: True,
+            "Country": True,
+            "Continent": True,
+            "Lat": False,
+            "Long": False,
+            "size_scaled": False
+        },
+        animation_frame=agg["YearMonth"].dt.strftime('%Y-%m'),
+        size_max=30, zoom=1, height=700,
+        color_continuous_scale="YlOrRd",
+        title=f"COVID‑19 {sel} – monatlich ({'nach Kontinent' if view == 'Continents' else 'nach Land'})"
     )
 
-    fig.update_layout(
-        margin=dict(l=0, r=0, t=40, b=0),
-        coloraxis_colorbar=dict(title=selected_metric),
-        legend_title_text=None
+    fig3.update_layout(margin=dict(l=0, r=0, t=40, b=0))
+    st.plotly_chart(fig3, use_container_width=True, config={"scrollZoom": True})
+
+
+# 🔥 Folium
+elif selected_tab == "🔥 Folium":
+    st.subheader("Statische Heatmap mit Folium")
+    sel = metric
+    anim = plot_df.copy()
+    anim["YearMonth"] = anim["Date"].dt.to_period("M").dt.to_timestamp()
+    agg = anim.groupby(["Country", "YearMonth", "Continent", "Lat", "Long"], as_index=False)[sel]
+    agg = agg.sum() if sel == "New Confirmed" else agg.max()
+    agg = agg.dropna(subset=["Lat", "Long"])
+    unique_months = agg["YearMonth"].sort_values().unique()
+    selected_month = st.select_slider(
+        "Monat auswählen",
+        options=unique_months,
+        value=unique_months[-1],
+        format_func=lambda d: d.strftime("%Y-%m")
     )
+    hmap = agg[agg["YearMonth"] == selected_month][["Lat", "Long", sel]].dropna()
+    if not hmap.empty:
+        hmap[sel] = hmap[sel] / hmap[sel].max()
+        m = folium.Map(location=[20, 0], zoom_start=1, tiles="OpenStreetMap")
+        HeatMap(hmap.values.tolist(), radius=25, blur=15).add_to(m)
+        st_folium(m, width=700, height=500)
+    else:
+        st.warning("Keine Daten für den ausgewählten Monat vorhanden.")
 
-    if fig.layout.updatemenus:
-        fig.layout.updatemenus[0].buttons[0].args[1]['frame']['duration'] = 700
-        fig.layout.updatemenus[0].buttons[1].args[1]['frame']['duration'] = 0
-
-    st.plotly_chart(fig, use_container_width=True, config={"scrollZoom": True})
-
-# CSV Download
-with tab4:
+# 📥 CSV
+elif selected_tab == "📥 CSV":
     st.subheader("CSV herunterladen")
-    csv = plot_df.to_csv(index=False).encode("utf-8")
-    st.download_button(
-        "CSV herunterladen",
-        csv,
-        file_name="covid_data.csv",
-        mime="text/csv"
-    )
+    st.download_button("CSV herunterladen", plot_df.to_csv(index=False).encode("utf-8"),
+                       file_name="covid_data.csv", mime="text/csv")
 
-# Export Hinweis
-with tab5:
-    st.subheader("Exportieren")
-    st.info(
-        "📌 Bitte nutze die interaktiven Plotly-Charts oben, um per Rechtsklick oder über das 'Download'-Symbol Grafiken als PNG oder SVG zu speichern.\n\n"
-        "Automatischer Bild-Export per Knopfdruck ist ohne Chrome/Chromium nicht möglich."
-    )
+# 📸 Export
+elif selected_tab == "📸 Export":
+    st.subheader("Export Hinweis")
+    st.info("📌 In den Plotly-Diagrammen das Download-Icon oder Rechtsklick zum Exportieren nutzen.")
