@@ -112,10 +112,27 @@ country_name_corrections = {
 }
 ```
 
-## 📊 Beispiel
-So sieht ein animiertes Kartenplot aus:
+## 📊 Screenshot's aus der App
 
-![Covid](./screenshot.png "covid")
+### Verlauf
+
+![Verlauf](screen_1.png "verlauf")
+
+### Heatmap
+
+![Heatmap](screen_2.png "heatmap")
+
+### Karte mit Plotly (nach Ländern)
+
+![Plotly_Map](screen_3.png "plotly_map")
+
+### Karte mit Plotly (nach Kontinenten)
+
+![Plotly_Map2](screen_4.png "plotly_map2")
+
+### Folium Map
+
+![Folium_Map](screen_5.png "folium_map")
 
 ## ❗ Hinweise
 * Populationen sind aktuell als Dummy (1.000.000) hinterlegt.
