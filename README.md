@@ -144,10 +144,11 @@ Passe bei Bedarf country_population an.
 
 ---
 
-## Lizenz und Nutzung
+## Lizenz
 
-Dieses Projekt nutzt Daten von der [JHU CSSE COVID-19 Data](https://github.com/CSSEGISandData/COVID-19).  
-Lizenz: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) – © Johns Hopkins University.
+Der Quellcode dieses Projekts steht unter der [Apache License 2.0](LICENSE).
 
-Bitte zitieren bei wissenschaftlicher Nutzung:  
-"Dong E, Du H, Gardner L. An interactive web-based dashboard to track COVID-19 in real time. Lancet Inf Dis. 20(5):533-534. doi: 10.1016/S1473-3099(20)30120-1"
+Die verwendeten COVID-19-Daten stammen aus dem  
+[COVID-19 Data Repository by the Center for Systems Science and Engineering (CSSE) at Johns Hopkins University](https://github.com/CSSEGISandData/COVID-19)  
+und stehen unter der Lizenz [Creative Commons Attribution 4.0 International (CC BY 4.0)](https://creativecommons.org/licenses/by/4.0/).  
+Bitte beachten Sie die Anforderungen zur Namensnennung gemäß CC BY 4.0.
