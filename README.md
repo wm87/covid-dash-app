@@ -141,3 +141,13 @@ Passe bei Bedarf country_population an.
 * Für größere Datenmengen kann die Performance sinken.
 
 * Automatischer Bild-Export ohne Browser ist nicht vorgesehen.
+
+---
+
+## Lizenz und Nutzung
+
+Dieses Projekt nutzt Daten von der [JHU CSSE COVID-19 Data](https://github.com/CSSEGISandData/COVID-19).  
+Lizenz: [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) – © Johns Hopkins University.
+
+Bitte zitieren bei wissenschaftlicher Nutzung:  
+"Dong E, Du H, Gardner L. An interactive web-based dashboard to track COVID-19 in real time. Lancet Inf Dis. 20(5):533-534. doi: 10.1016/S1473-3099(20)30120-1"
